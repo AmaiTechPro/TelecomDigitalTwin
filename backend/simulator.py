@@ -4,6 +4,7 @@ import json
 import random
 import time
 import threading
+
 import paho.mqtt.client as mqtt
 
 from datetime import datetime, timezone
@@ -14,12 +15,23 @@ SITE_ID = "TELECOM-SITE-001"
 MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 
+CONTROL_TOPIC = f"telecom/site/{SITE_ID}/control/faults"
+
 MQTT_TOPICS = {
     "TOWER-SENSOR-001": "tower",
     "BACKHAUL-MONITOR-001": "backhaul",
     "RAN-MONITOR-001": "ran",
     "POWER-MONITOR-001": "power"
 }
+
+ALLOWED_FAULTS = {
+    "backhaul_failure",
+    "overheating",
+    "power_failure",
+    "congestion",
+    "sensor_failure"
+}
+
 
 def timestamp():
     return datetime.now(timezone.utc).isoformat()
@@ -32,39 +44,88 @@ def clamp(value, minimum, maximum):
 class TelecomSimulator:
 
     def __init__(self, scenario="normal"):
-        self.scenario = scenario
+
         self.temperature = 29.0
         self.latency = 24.0
         self.signal_strength = -82.0
         self.battery_level = 96.0
 
+        # Protect fault state shared by MQTT and simulator threads.
+        self._fault_lock = threading.Lock()
+
+        # Preserve existing startup scenario functionality.
+        self.active_faults = set()
+
+        if scenario != "normal":
+            self.active_faults.add(scenario)
+
+    def is_fault_active(self, fault):
+
+        with self._fault_lock:
+            return fault in self.active_faults
+
+    def get_active_faults(self):
+
+        with self._fault_lock:
+            return sorted(self.active_faults)
+
+    def activate_fault(self, fault):
+
+        if fault not in ALLOWED_FAULTS:
+            return False
+
+        with self._fault_lock:
+            self.active_faults.add(fault)
+
+        return True
+
+    def clear_fault(self, fault):
+
+        with self._fault_lock:
+            self.active_faults.discard(fault)
+
+    def clear_all_faults(self):
+
+        with self._fault_lock:
+            self.active_faults.clear()
+
     def tower_sensor(self):
-        if self.scenario == "sensor_failure":
-          return {
-        "device_id": "TOWER-SENSOR-001",
-        "device_type": "ENVIRONMENTAL_SENSOR",
-        "status": "CRITICAL",
-        "telemetry": {
-            "temperature": {
-                "value": None,
-                "unit": "°C"
-            },
-            "sensor_available": False
-        }
-    }
+
+        if self.is_fault_active("sensor_failure"):
+
+            return {
+                "device_id": "TOWER-SENSOR-001",
+                "device_type": "ENVIRONMENTAL_SENSOR",
+                "status": "CRITICAL",
+                "telemetry": {
+                    "temperature": {
+                        "value": None,
+                        "unit": "°C"
+                    },
+                    "sensor_available": False
+                }
+            }
+
+        if self.is_fault_active("overheating"):
+
+            return {
+                "device_id": "TOWER-SENSOR-001",
+                "device_type": "ENVIRONMENTAL_SENSOR",
+                "status": "CRITICAL",
+                "telemetry": {
+                    "temperature": {
+                        "value": 85.0,
+                        "unit": "°C"
+                    },
+                    "sensor_available": True
+                }
+            }
+
         self.temperature = clamp(
             self.temperature + random.uniform(-1.2, 1.2),
-            20, 50
+            20,
+            50
         )
-        if self.scenario == "overheating":
-         return {
-        "device_id": "TOWER-SENSOR-001",
-        "device_type": "ENVIRONMENTAL_SENSOR",
-        "status": "CRITICAL",
-        "telemetry": {
-            "temperature": {"value": 85, "unit": "°C"}
-        }
-    }
 
         status = (
             "CRITICAL" if self.temperature >= 45
@@ -80,35 +141,40 @@ class TelecomSimulator:
                 "temperature": {
                     "value": self.temperature,
                     "unit": "°C"
-                }
+                },
+                "sensor_available": True
             }
         }
 
     def backhaul_monitor(self):
-        if self.scenario == "backhaul_failure":
-         return {
-        "device_id": "BACKHAUL-MONITOR-001",
-        "device_type": "BACKHAUL_MONITOR",
-        "status": "CRITICAL",
-        "telemetry": {
-            "latency": {
-                "value": 999,
-                "unit": "ms"
-            },
-            "packet_loss": {
-                "value": 100,
-                "unit": "%"
-            },
-            "throughput": {
-                "value": 0,
-                "unit": "Mbps"
-            },
-            "link_available": False
-        }
-    }
+
+        if self.is_fault_active("backhaul_failure"):
+
+            return {
+                "device_id": "BACKHAUL-MONITOR-001",
+                "device_type": "BACKHAUL_MONITOR",
+                "status": "CRITICAL",
+                "telemetry": {
+                    "latency": {
+                        "value": 999,
+                        "unit": "ms"
+                    },
+                    "packet_loss": {
+                        "value": 100,
+                        "unit": "%"
+                    },
+                    "throughput": {
+                        "value": 0,
+                        "unit": "Mbps"
+                    },
+                    "link_available": False
+                }
+            }
+
         self.latency = clamp(
             self.latency + random.uniform(-4, 4),
-            10, 150
+            10,
+            150
         )
 
         packet_loss = round(random.uniform(0, 2), 2)
@@ -141,20 +207,30 @@ class TelecomSimulator:
         }
 
     def ran_monitor(self):
-        if self.scenario == "congestion":
-         return {
-        "device_id": "RAN-MONITOR-001",
-        "device_type": "RAN_PERFORMANCE_MONITOR",
-        "status": "CRITICAL",
-        "telemetry": {
-            "signal_strength": {"value": -82, "unit": "dBm"},
-            "bandwidth_utilization": {"value": 98, "unit": "%"},
-            "congestion": True
-        }
-    }
+
+        if self.is_fault_active("congestion"):
+
+            return {
+                "device_id": "RAN-MONITOR-001",
+                "device_type": "RAN_PERFORMANCE_MONITOR",
+                "status": "CRITICAL",
+                "telemetry": {
+                    "signal_strength": {
+                        "value": self.signal_strength,
+                        "unit": "dBm"
+                    },
+                    "bandwidth_utilization": {
+                        "value": 98.0,
+                        "unit": "%"
+                    },
+                    "congestion": True
+                }
+            }
+
         self.signal_strength = clamp(
             self.signal_strength + random.uniform(-3, 3),
-            -110, -60
+            -110,
+            -60
         )
 
         utilization = round(random.uniform(15, 95), 2)
@@ -182,20 +258,30 @@ class TelecomSimulator:
         }
 
     def power_monitor(self):
-        if self.scenario == "power_failure":
-         return {
-        "device_id": "POWER-MONITOR-001",
-        "device_type": "POWER_MONITOR",
-        "status": "CRITICAL",
-        "telemetry": {
-            "voltage": {"value": 0, "unit": "V"},
-            "battery_level": {"value": 0, "unit": "%"},
-            "power_available": False
-        }
-    }
+
+        if self.is_fault_active("power_failure"):
+
+            return {
+                "device_id": "POWER-MONITOR-001",
+                "device_type": "POWER_MONITOR",
+                "status": "CRITICAL",
+                "telemetry": {
+                    "voltage": {
+                        "value": 0,
+                        "unit": "V"
+                    },
+                    "battery_level": {
+                        "value": 0,
+                        "unit": "%"
+                    },
+                    "power_available": False
+                }
+            }
+
         self.battery_level = clamp(
             self.battery_level + random.uniform(-0.3, 0.2),
-            70, 100
+            70,
+            100
         )
 
         voltage = round(random.uniform(47, 54), 2)
@@ -222,14 +308,82 @@ class TelecomSimulator:
             }
         }
 
+
 def on_connect(client, userdata, flags, reason_code, properties):
+
     if reason_code == 0:
-        print("MQTT broker connection successful.")
-        userdata.set()
+
+        print("[MQTT] Simulator connected to broker.")
+
+        userdata["connected"].set()
+
+        client.subscribe(CONTROL_TOPIC, qos=1)
+
+        print(f"[CONTROL] Subscribed to {CONTROL_TOPIC}")
+
     else:
-        print(f"MQTT connection failed: {reason_code}")
+
+        print(f"[MQTT] Connection failed: {reason_code}")
+
+
+
+def on_message(client, userdata, message):
+
+    simulator = userdata["simulator"]
+
+    try:
+        raw_payload = message.payload.decode("utf-8")
+
+        print(f"[CONTROL DEBUG] Raw payload: {raw_payload!r}")
+
+        command = json.loads(raw_payload)
+
+        if not isinstance(command, dict):
+            print("[CONTROL] Rejected: command must be a JSON object.")
+            return
+
+        if command.get("site_id") != SITE_ID:
+            print("[CONTROL] Rejected: unknown site.")
+            return
+
+        action = command.get("action")
+        fault = command.get("fault")
+
+        if action == "activate":
+
+            if not isinstance(fault, str) or fault not in ALLOWED_FAULTS:
+                print("[CONTROL] Rejected: invalid fault.")
+                return
+
+            simulator.activate_fault(fault)
+            print(f"[FAULT ACTIVATED] {fault}")
+
+        elif action == "clear":
+
+            if not isinstance(fault, str) or fault not in ALLOWED_FAULTS:
+                print("[CONTROL] Rejected: invalid fault.")
+                return
+
+            simulator.clear_fault(fault)
+            print(f"[FAULT CLEARED] {fault}")
+
+        elif action == "clear_all":
+
+            simulator.clear_all_faults()
+            print("[FAULT CONTROL] All faults cleared.")
+
+        else:
+            print(f"[CONTROL] Rejected: unsupported action {action!r}")
+
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        print(f"[CONTROL] Invalid JSON: {error}")
+
+    except Exception as error:
+        print(f"[CONTROL] Command processing error: {error}")
+
 
 def main():
+
     parser = argparse.ArgumentParser(
         description="Virtual Telecommunications Device Simulator"
     )
@@ -242,18 +396,18 @@ def main():
     )
 
     parser.add_argument(
-    "--scenario",
-    choices=[
-    "normal",
-    "backhaul_failure",
-    "overheating",
-    "congestion",
-    "power_failure",
-    "sensor_failure"
-   ],
-    default="normal",
-    help="Select the simulation scenario"
-)
+        "--scenario",
+        choices=[
+            "normal",
+            "backhaul_failure",
+            "overheating",
+            "congestion",
+            "power_failure",
+            "sensor_failure"
+        ],
+        default="normal",
+        help="Select the initial simulation scenario"
+    )
 
     args = parser.parse_args()
 
@@ -271,13 +425,19 @@ def main():
 
     connected = threading.Event()
 
+    userdata = {
+        "simulator": simulator,
+        "connected": connected
+    }
+
     mqtt_client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,
         client_id="telecom-digital-twin-simulator",
-        userdata=connected
+        userdata=userdata
     )
 
     mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
 
     print("=" * 65)
     print(" TELECOM DIGITAL TWIN - VIRTUAL DEVICE SIMULATOR")
@@ -285,21 +445,34 @@ def main():
     print(f"Site ID: {SITE_ID}")
     print(f"Devices: {len(devices)}")
     print(f"Reporting interval: {args.interval} seconds")
-    print(f"Scenario: {args.scenario}")
+    print(f"Initial scenario: {args.scenario}")
+    print(f"Active faults: {simulator.get_active_faults()}")
     print("Data source: SIMULATED")
+    print("Runtime fault control: ENABLED")
     print("Press CTRL+C to stop.")
     print("=" * 65)
 
     try:
-        print(f"Connecting to MQTT broker {MQTT_BROKER}:{MQTT_PORT}...")
 
-        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        print(
+            f"Connecting to MQTT broker "
+            f"{MQTT_BROKER}:{MQTT_PORT}..."
+        )
+
+        mqtt_client.connect(
+            MQTT_BROKER,
+            MQTT_PORT,
+            keepalive=60
+        )
+
         mqtt_client.loop_start()
 
         if not connected.wait(timeout=10):
             raise RuntimeError("MQTT broker connection timed out.")
 
         while True:
+
+            active_faults = simulator.get_active_faults()
 
             for device_function in devices:
 
@@ -308,13 +481,16 @@ def main():
                     "timestamp": timestamp(),
                     "simulation": True,
                     "data_source": "SIMULATED",
+                    "active_faults": active_faults,
                     **device_function()
                 }
 
                 device_id = event["device_id"]
                 topic_suffix = MQTT_TOPICS[device_id]
 
-                topic = f"telecom/site/{SITE_ID}/{topic_suffix}"
+                topic = (
+                    f"telecom/site/{SITE_ID}/{topic_suffix}"
+                )
 
                 payload = json.dumps(event)
 
@@ -325,11 +501,16 @@ def main():
                 )
 
                 if result.rc == mqtt.MQTT_ERR_SUCCESS:
+
                     print(
-                        f"[MQTT PUBLISHED] {topic} {payload}",
+                        f"[MQTT PUBLISHED] {device_id} "
+                        f"| Status: {event['status']} "
+                        f"| Active faults: {active_faults}",
                         flush=True
                     )
+
                 else:
+
                     print(
                         f"[MQTT ERROR] Failed to publish {device_id}"
                     )
@@ -337,9 +518,11 @@ def main():
             time.sleep(args.interval)
 
     except KeyboardInterrupt:
+
         print("\nSimulator stopped successfully.")
 
     finally:
+
         mqtt_client.disconnect()
         mqtt_client.loop_stop()
 

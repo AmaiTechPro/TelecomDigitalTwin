@@ -1,6 +1,13 @@
+
+import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 
 from telemetry_store import (
     get_all_telemetry,
@@ -9,16 +16,26 @@ from telemetry_store import (
 )
 
 from mqtt_service import mqtt_service
+from websocket_manager import manager
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
+    # Register FastAPI's event loop with the MQTT service.
+    mqtt_service.set_event_loop(asyncio.get_running_loop())
+
+    print("[API] Event loop registered with MQTT service")
+
+    # Start MQTT service.
     mqtt_service.start()
 
     yield
 
+    # Stop MQTT service during application shutdown.
     mqtt_service.stop()
+
+    print("[API] Application shutdown complete")
 
 
 app = FastAPI(
@@ -71,3 +88,20 @@ async def device_telemetry(device_id: str):
         )
 
     return event
+
+
+@app.websocket("/ws/telemetry")
+async def telemetry_websocket(websocket: WebSocket):
+
+    await manager.connect(websocket)
+
+    try:
+        while True:
+            await websocket.receive_text()
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+    except Exception as error:
+        print(f"[WEBSOCKET] Connection error: {error}")
+        manager.disconnect(websocket)
